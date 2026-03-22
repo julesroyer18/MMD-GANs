@@ -19,7 +19,9 @@ def mmd2_unbiased(x: torch.Tensor, y: torch.Tensor, kernel: KernelFn) -> torch.T
     n = x.shape[0]
     m = y.shape[0]
     if n < 2 or m < 2:
-        raise ValueError("Need at least two samples per set for unbiased MMD estimator.")
+        raise ValueError(
+            "Need at least two samples per set for unbiased MMD estimator."
+        )
 
     k_xx = kernel(x, x)
     k_yy = kernel(y, y)
