@@ -287,6 +287,20 @@ python3 scripts/run_cifar10_v2.py \
   --steps 30000
 ```
 
+To run only one MMD configuration instead of the full three-run suite:
+
+```bash
+python3 scripts/run_cifar10_v2.py \
+  --runs mmd_small_rq_star \
+  --steps 30000
+```
+
+Other valid values are:
+
+- `mmd_large_rq_star`
+- `mmd_small_rbf`
+- `wgan_large`
+
 For a quick infrastructure test before the longer run:
 
 ```bash
@@ -327,3 +341,28 @@ python3 scripts/run_cifar10_v2.py --suite paper --steps 30000
 - sample images inside the run subdirectories
 - `deliverables.md` for the bias illustration write-up
 - `comparison_matrix.md` for the CIFAR-10 protocol launcher
+
+### G. Theorem 2 Data-Splitting Demo
+
+This is the clean theorem-focused experiment with a finite critic dictionary, explicit train/test splitting, a population supremum estimate, and train-size ablations.
+
+Recommended launch:
+
+```bash
+python3 scripts/run_theorem2_data_split_demo.py \
+  --delta-grid=-2,-1.5,-1,-0.5,0,0.5,1,1.5,2 \
+  --train-sizes 16,32,64,256 \
+  --test-size 4096 \
+  --repetitions 1000 \
+  --truth-samples 200000
+```
+
+Main outputs:
+
+- `population_vs_split.png`
+- `bias_vs_delta.png`
+- `selection_accuracy_vs_delta.png`
+- `gradient_vs_delta.png`
+- `theorem2_overview.png`
+- `summary.json`
+- `deliverables.md`
