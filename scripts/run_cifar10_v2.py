@@ -84,6 +84,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--deterministic", action="store_true")
     p.add_argument("--include-wgan", action="store_true")
     p.add_argument(
+        "--runs",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated subset of runs to execute. "
+            "Choices: mmd_small_rq_star,mmd_large_rq_star,mmd_small_rbf,wgan_large"
+        ),
+    )
+    p.add_argument(
         "--suite",
         choices=["course", "paper"],
         default="course",
@@ -198,6 +207,24 @@ def build_suite(args: argparse.Namespace) -> List[CifarRunSpec]:
             )
         )
     return suite
+
+
+def selected_run_names(raw: str) -> List[str]:
+    return [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+
+
+def filter_suite(specs: List[CifarRunSpec], raw_names: str) -> List[CifarRunSpec]:
+    requested = selected_run_names(raw_names)
+    if not requested:
+        return specs
+
+    by_name = {spec.name: spec for spec in specs}
+    unknown = [name for name in requested if name not in by_name]
+    if unknown:
+        available = ",".join(by_name.keys())
+        raise ValueError(f"Unknown run name(s): {','.join(unknown)}. Available runs: {available}")
+
+    return [by_name[name] for name in requested]
 
 
 def train_mmd_run(
@@ -469,7 +496,7 @@ def main() -> None:
 
     device = pick_device(prefer_cuda=True)
     run_root = ensure_dir(Path(args.outdir) / timestamp())
-    suite = build_suite(args)
+    suite = filter_suite(build_suite(args), args.runs)
 
     print(f"[info] device: {device_summary(device)}")
     print(f"[info] output root: {run_root}")
