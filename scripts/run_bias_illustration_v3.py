@@ -21,7 +21,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover - dependency error path
 from mmd_gan_experiments.kernels import build_kernel
 from mmd_gan_experiments.mmd import mmd2_unbiased
 from mmd_gan_experiments.protocol_v2_helpers import BiasFeatureCritic
-from mmd_gan_experiments.utils import ensure_dir, pick_device, save_json, seed_everything, timestamp
+from mmd_gan_experiments.utils import (
+    ensure_dir,
+    pick_device,
+    save_json,
+    seed_everything,
+    timestamp,
+)
 
 try:
     from tqdm.auto import trange
@@ -33,21 +39,27 @@ RQ_ALPHAS = (0.2, 0.5, 1.0, 2.0, 5.0)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Finite-sample critic-bias illustration (v3)")
+    p = argparse.ArgumentParser(
+        description="Finite-sample critic-bias illustration (v3)"
+    )
     p.add_argument("--delta-grid", type=str, default="-2,-1.5,-1,-0.5,0,0.5,1,1.5,2")
     p.add_argument("--num-seeds", type=int, default=20)
     p.add_argument("--seed-offset", type=int, default=0)
     p.add_argument("--train-size", type=int, default=512)
     p.add_argument("--holdout-size", type=int, default=512)
     p.add_argument("--kernel", choices=["rq", "rbf", "linear"], default="rq")
-    p.add_argument("--critic-hidden-dim", type=int, default=64)
-    p.add_argument("--critic-feat-dim", type=int, default=8)
+    p.add_argument("--critic-hidden-dim", type=int, default=8)
+    p.add_argument("--critic-feat-dim", type=int, default=4)
     p.add_argument("--critic-steps", type=int, default=1500)
     p.add_argument("--critic-lr", type=float, default=3e-4)
     p.add_argument("--activation-penalty", type=float, default=1e-3)
-    p.add_argument("--gradient-mode", choices=["autograd", "finite-diff"], default="autograd")
+    p.add_argument(
+        "--gradient-mode", choices=["autograd", "finite-diff"], default="autograd"
+    )
     p.add_argument("--finite-diff-eps", type=float, default=1e-2)
-    p.add_argument("--fixed-critic-mode", choices=["trained", "random"], default="trained")
+    p.add_argument(
+        "--fixed-critic-mode", choices=["trained", "random"], default="trained"
+    )
     p.add_argument("--fixed-critic-delta0", type=float, default=1.0)
     p.add_argument("--fixed-critic-seed", type=int, default=1234)
     p.add_argument("--fixed-critic-train-size", type=int, default=2048)
@@ -117,7 +129,9 @@ def train_critic(
     activation_penalty: float,
     kernel,
 ) -> torch.nn.Module:
-    critic = BiasFeatureCritic(hidden_dim=hidden_dim, feat_dim=feat_dim).to(real_train.device)
+    critic = BiasFeatureCritic(hidden_dim=hidden_dim, feat_dim=feat_dim).to(
+        real_train.device
+    )
     optimizer = torch.optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
     delta_value = torch.tensor(float(delta), device=real_train.device)
 
@@ -126,7 +140,9 @@ def train_critic(
         feat_real = critic(real_train)
         feat_fake = critic(fake_train)
         mmd2 = mmd2_unbiased(feat_real, feat_fake, kernel)
-        penalty = activation_penalty * (feat_real.pow(2).mean() + feat_fake.pow(2).mean())
+        penalty = activation_penalty * (
+            feat_real.pow(2).mean() + feat_fake.pow(2).mean()
+        )
         loss = -mmd2 + penalty
 
         optimizer.zero_grad(set_to_none=True)
@@ -171,14 +187,20 @@ def gradient_estimate(
     return float(((loss_plus - loss_minus) / (2.0 * eps)).cpu())
 
 
-def train_or_build_fixed_critic(args: argparse.Namespace, kernel, device: torch.device) -> torch.nn.Module:
+def train_or_build_fixed_critic(
+    args: argparse.Namespace, kernel, device: torch.device
+) -> torch.nn.Module:
     seed_everything(args.fixed_critic_seed)
-    critic = BiasFeatureCritic(hidden_dim=args.critic_hidden_dim, feat_dim=args.critic_feat_dim).to(device)
+    critic = BiasFeatureCritic(
+        hidden_dim=args.critic_hidden_dim, feat_dim=args.critic_feat_dim
+    ).to(device)
     if args.fixed_critic_mode == "random":
         freeze_module(critic)
         return critic
 
-    real_ref, noise_ref = sample_location_family_with_noise(args.fixed_critic_train_size, device)
+    real_ref, noise_ref = sample_location_family_with_noise(
+        args.fixed_critic_train_size, device
+    )
     trained = train_critic(
         real_train=real_ref,
         noise_train=noise_ref,
@@ -268,7 +290,9 @@ def main() -> None:
         "gradient_holdout": [],
     }
 
-    for seed in trange(args.seed_offset, args.seed_offset + args.num_seeds, desc="bias-v3"):
+    for seed in trange(
+        args.seed_offset, args.seed_offset + args.num_seeds, desc="bias-v3"
+    ):
         objective_fixed_curve: List[float] = []
         objective_train_curve: List[float] = []
         objective_holdout_curve: List[float] = []
@@ -279,8 +303,12 @@ def main() -> None:
         for delta_idx, delta in enumerate(delta_grid):
             data_seed = seed * 1000 + delta_idx
             seed_everything(data_seed)
-            real_train, noise_train = sample_location_family_with_noise(args.train_size, device)
-            real_holdout, noise_holdout = sample_location_family_with_noise(args.holdout_size, device)
+            real_train, noise_train = sample_location_family_with_noise(
+                args.train_size, device
+            )
+            real_holdout, noise_holdout = sample_location_family_with_noise(
+                args.holdout_size, device
+            )
 
             critic_seed = 1_000_000 + seed * 1000 + delta_idx
             seed_everything(critic_seed)
@@ -299,14 +327,32 @@ def main() -> None:
             with torch.no_grad():
                 delta_value = torch.tensor(float(delta), device=device)
                 objective_fixed_curve.append(
-                    float(objective_with_delta(fixed_critic, real_holdout, noise_holdout, delta_value, kernel).cpu())
+                    float(
+                        objective_with_delta(
+                            fixed_critic,
+                            real_holdout,
+                            noise_holdout,
+                            delta_value,
+                            kernel,
+                        ).cpu()
+                    )
                 )
                 objective_train_curve.append(
-                    float(objective_with_delta(learned_critic, real_train, noise_train, delta_value, kernel).cpu())
+                    float(
+                        objective_with_delta(
+                            learned_critic, real_train, noise_train, delta_value, kernel
+                        ).cpu()
+                    )
                 )
                 objective_holdout_curve.append(
                     float(
-                        objective_with_delta(learned_critic, real_holdout, noise_holdout, delta_value, kernel).cpu()
+                        objective_with_delta(
+                            learned_critic,
+                            real_holdout,
+                            noise_holdout,
+                            delta_value,
+                            kernel,
+                        ).cpu()
                     )
                 )
 
@@ -351,22 +397,57 @@ def main() -> None:
         per_seed["gradient_train"].append(gradient_train_curve)
         per_seed["gradient_holdout"].append(gradient_holdout_curve)
 
-    objective_fixed_mean, objective_fixed_std = curve_mean_std(per_seed["objective_fixed"])
-    objective_train_mean, objective_train_std = curve_mean_std(per_seed["objective_train"])
-    objective_holdout_mean, objective_holdout_std = curve_mean_std(per_seed["objective_holdout"])
+    objective_fixed_mean, objective_fixed_std = curve_mean_std(
+        per_seed["objective_fixed"]
+    )
+    objective_train_mean, objective_train_std = curve_mean_std(
+        per_seed["objective_train"]
+    )
+    objective_holdout_mean, objective_holdout_std = curve_mean_std(
+        per_seed["objective_holdout"]
+    )
     gradient_fixed_mean, gradient_fixed_std = curve_mean_std(per_seed["gradient_fixed"])
     gradient_train_mean, gradient_train_std = curve_mean_std(per_seed["gradient_train"])
-    gradient_holdout_mean, gradient_holdout_std = curve_mean_std(per_seed["gradient_holdout"])
+    gradient_holdout_mean, gradient_holdout_std = curve_mean_std(
+        per_seed["gradient_holdout"]
+    )
 
-    learned_gap = np.asarray(per_seed["objective_train"]) - np.asarray(per_seed["objective_holdout"])
-    learned_grad_gap = np.asarray(per_seed["gradient_train"]) - np.asarray(per_seed["gradient_holdout"])
+    learned_gap = np.asarray(per_seed["objective_train"]) - np.asarray(
+        per_seed["objective_holdout"]
+    )
+    learned_grad_gap = np.asarray(per_seed["gradient_train"]) - np.asarray(
+        per_seed["gradient_holdout"]
+    )
     learned_gap_mean, learned_gap_std = curve_mean_std(learned_gap.tolist())
-    learned_grad_gap_mean, learned_grad_gap_std = curve_mean_std(learned_grad_gap.tolist())
+    learned_grad_gap_mean, learned_grad_gap_std = curve_mean_std(
+        learned_grad_gap.tolist()
+    )
 
     fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    plot_with_bands(ax, delta_grid, objective_fixed_mean, objective_fixed_std, "Fixed critic", "black")
-    plot_with_bands(ax, delta_grid, objective_train_mean, objective_train_std, "Learned critic, train", "C3")
-    plot_with_bands(ax, delta_grid, objective_holdout_mean, objective_holdout_std, "Learned critic, holdout", "C0")
+    plot_with_bands(
+        ax,
+        delta_grid,
+        objective_fixed_mean,
+        objective_fixed_std,
+        "Fixed critic",
+        "black",
+    )
+    plot_with_bands(
+        ax,
+        delta_grid,
+        objective_train_mean,
+        objective_train_std,
+        "Learned critic, train",
+        "C3",
+    )
+    plot_with_bands(
+        ax,
+        delta_grid,
+        objective_holdout_mean,
+        objective_holdout_std,
+        "Learned critic, holdout",
+        "C0",
+    )
     ax.set_title("Objective vs delta")
     ax.set_xlabel("delta")
     ax.set_ylabel("empirical MMD^2")
@@ -377,9 +458,25 @@ def main() -> None:
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    plot_with_bands(ax, delta_grid, gradient_fixed_mean, gradient_fixed_std, "Fixed critic", "black")
-    plot_with_bands(ax, delta_grid, gradient_train_mean, gradient_train_std, "Learned critic, train", "C3")
-    plot_with_bands(ax, delta_grid, gradient_holdout_mean, gradient_holdout_std, "Learned critic, holdout", "C0")
+    plot_with_bands(
+        ax, delta_grid, gradient_fixed_mean, gradient_fixed_std, "Fixed critic", "black"
+    )
+    plot_with_bands(
+        ax,
+        delta_grid,
+        gradient_train_mean,
+        gradient_train_std,
+        "Learned critic, train",
+        "C3",
+    )
+    plot_with_bands(
+        ax,
+        delta_grid,
+        gradient_holdout_mean,
+        gradient_holdout_std,
+        "Learned critic, holdout",
+        "C0",
+    )
     ax.axhline(0.0, color="0.65", linewidth=1.0)
     ax.set_title("Gradient vs delta")
     ax.set_xlabel("delta")
@@ -391,14 +488,23 @@ def main() -> None:
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.6))
-    plot_with_bands(axes[0], delta_grid, learned_gap_mean, learned_gap_std, "Train - holdout", "C4")
+    plot_with_bands(
+        axes[0], delta_grid, learned_gap_mean, learned_gap_std, "Train - holdout", "C4"
+    )
     axes[0].axhline(0.0, color="0.65", linewidth=1.0)
     axes[0].set_title("Objective gap")
     axes[0].set_xlabel("delta")
     axes[0].set_ylabel("MMD^2 gap")
     axes[0].grid(alpha=0.25)
 
-    plot_with_bands(axes[1], delta_grid, learned_grad_gap_mean, learned_grad_gap_std, "Train - holdout", "C5")
+    plot_with_bands(
+        axes[1],
+        delta_grid,
+        learned_grad_gap_mean,
+        learned_grad_gap_std,
+        "Train - holdout",
+        "C5",
+    )
     axes[1].axhline(0.0, color="0.65", linewidth=1.0)
     axes[1].set_title("Gradient gap")
     axes[1].set_xlabel("delta")
@@ -412,14 +518,38 @@ def main() -> None:
         "args": vars(args),
         "device": str(device),
         "delta_grid": delta_grid.tolist(),
-        "objective_fixed": {"mean": objective_fixed_mean.tolist(), "std": objective_fixed_std.tolist()},
-        "objective_train": {"mean": objective_train_mean.tolist(), "std": objective_train_std.tolist()},
-        "objective_holdout": {"mean": objective_holdout_mean.tolist(), "std": objective_holdout_std.tolist()},
-        "gradient_fixed": {"mean": gradient_fixed_mean.tolist(), "std": gradient_fixed_std.tolist()},
-        "gradient_train": {"mean": gradient_train_mean.tolist(), "std": gradient_train_std.tolist()},
-        "gradient_holdout": {"mean": gradient_holdout_mean.tolist(), "std": gradient_holdout_std.tolist()},
-        "learned_objective_gap": {"mean": learned_gap_mean.tolist(), "std": learned_gap_std.tolist()},
-        "learned_gradient_gap": {"mean": learned_grad_gap_mean.tolist(), "std": learned_grad_gap_std.tolist()},
+        "objective_fixed": {
+            "mean": objective_fixed_mean.tolist(),
+            "std": objective_fixed_std.tolist(),
+        },
+        "objective_train": {
+            "mean": objective_train_mean.tolist(),
+            "std": objective_train_std.tolist(),
+        },
+        "objective_holdout": {
+            "mean": objective_holdout_mean.tolist(),
+            "std": objective_holdout_std.tolist(),
+        },
+        "gradient_fixed": {
+            "mean": gradient_fixed_mean.tolist(),
+            "std": gradient_fixed_std.tolist(),
+        },
+        "gradient_train": {
+            "mean": gradient_train_mean.tolist(),
+            "std": gradient_train_std.tolist(),
+        },
+        "gradient_holdout": {
+            "mean": gradient_holdout_mean.tolist(),
+            "std": gradient_holdout_std.tolist(),
+        },
+        "learned_objective_gap": {
+            "mean": learned_gap_mean.tolist(),
+            "std": learned_gap_std.tolist(),
+        },
+        "learned_gradient_gap": {
+            "mean": learned_grad_gap_mean.tolist(),
+            "std": learned_grad_gap_std.tolist(),
+        },
     }
     save_json(payload, run_root / "summary.json")
 
