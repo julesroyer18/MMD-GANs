@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Tuple
 
 import torch
@@ -34,46 +36,68 @@ from mmd_gan_experiments.utils import (
     timestamp,
 )
 
-
 try:
     from tqdm.auto import trange
 except Exception:  # pragma: no cover
     trange = range
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CIFAR-10 MMD-GAN / WGAN-GP experiments")
-    p.add_argument("--method", choices=["mmd", "wgan"], default="mmd")
-    p.add_argument("--kernel-list", type=str, default="rq", help="Comma-separated kernels for MMD method")
-    p.add_argument("--run-baseline-wgan", action="store_true", help="Also run WGAN-GP after MMD runs")
+RBF_SIGMAS = (2.0, 5.0, 10.0, 20.0, 40.0, 80.0)
+RQ_ALPHAS = (0.2, 0.5, 1.0, 2.0, 5.0)
 
-    p.add_argument("--steps", type=int, default=30000, help="Generator updates")
+
+@dataclass
+class CifarRunSpec:
+    name: str
+    method: str
+    critic_size: str
+    critic_base_channels: int
+    kernel: str | None
+    feature_dim: int | None
+    use_gp: bool
+    activation_penalty: float
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Protocol-oriented CIFAR-10 experiment suite (v2)")
+    p.add_argument("--steps", type=int, default=30_000, help="Generator updates")
     p.add_argument("--critic-steps", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=4)
-
     p.add_argument("--lr-g", type=float, default=1e-4)
     p.add_argument("--lr-c", type=float, default=1e-4)
     p.add_argument("--z-dim", type=int, default=128)
-    p.add_argument("--base-channels", type=int, default=64)
-    p.add_argument("--feature-dim", type=int, default=128)
-
-    p.add_argument("--no-gp", action="store_false", dest="use_gp", help="Disable gradient penalty")
-    p.set_defaults(use_gp=True)
+    p.add_argument("--generator-base-channels", type=int, default=64)
+    p.add_argument("--feature-dim", type=int, default=16)
     p.add_argument("--gp-lambda-mmd", type=float, default=1.0)
     p.add_argument("--gp-lambda-wgan", type=float, default=10.0)
     p.add_argument("--activation-penalty", type=float, default=1.0)
-
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--sample-every", type=int, default=2000)
-    p.add_argument("--metrics-every", type=int, default=5000)
-    p.add_argument("--save-every", type=int, default=5000)
-    p.add_argument("--metric-samples", type=int, default=10000)
-
+    p.add_argument("--sample-every", type=int, default=5_000)
+    p.add_argument("--metrics-every", type=int, default=5_000)
+    p.add_argument("--save-every", type=int, default=5_000)
+    p.add_argument("--checkpoint-metric-samples", type=int, default=10_000)
+    p.add_argument("--final-metric-samples", type=int, default=25_000)
     p.add_argument("--data-root", type=str, default="data/cifar10")
-    p.add_argument("--outdir", type=str, default="results/cifar10")
+    p.add_argument("--outdir", type=str, default="results/cifar10_v2")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--deterministic", action="store_true")
+    p.add_argument("--include-wgan", action="store_true")
+    p.add_argument(
+        "--runs",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated subset of runs to execute. "
+            "Choices: mmd_small_rq_star,mmd_large_rq_star,mmd_small_rbf,wgan_large"
+        ),
+    )
+    p.add_argument(
+        "--suite",
+        choices=["course", "paper"],
+        default="course",
+        help="course: three MMD runs; paper: add WGAN-GP baseline automatically",
+    )
     return p.parse_args()
 
 
@@ -111,7 +135,19 @@ def get_cifar_loaders(
     return train_loader, eval_loader
 
 
-def _sample_and_save(generator: nn.Module, fixed_noise: torch.Tensor, path: Path) -> None:
+def build_mmd_kernel(name: str):
+    if name == "rq_star":
+        return build_kernel("rq", rq_alphas=RQ_ALPHAS, rq_add_linear=True)
+    if name == "rbf":
+        return build_kernel("rbf", rbf_sigmas=RBF_SIGMAS)
+    raise ValueError(f"Unsupported MMD kernel: {name}")
+
+
+def mean_feature_norm(feats: torch.Tensor) -> float:
+    return float(feats.norm(dim=1).mean().detach().cpu())
+
+
+def save_grid(generator: nn.Module, fixed_noise: torch.Tensor, path: Path) -> None:
     generator.eval()
     with torch.no_grad():
         fake = generator(fixed_noise)
@@ -119,31 +155,120 @@ def _sample_and_save(generator: nn.Module, fixed_noise: torch.Tensor, path: Path
     save_image((fake + 1.0) * 0.5, str(path), nrow=8)
 
 
-def train_mmd(
-    kernel_name: str,
+def metric_sample_budget(args: argparse.Namespace, step: int) -> int:
+    return args.final_metric_samples if step == args.steps else args.checkpoint_metric_samples
+
+
+def build_suite(args: argparse.Namespace) -> List[CifarRunSpec]:
+    suite = [
+        CifarRunSpec(
+            name="mmd_small_rq_star",
+            method="mmd",
+            critic_size="small",
+            critic_base_channels=16,
+            kernel="rq_star",
+            feature_dim=args.feature_dim,
+            use_gp=True,
+            activation_penalty=args.activation_penalty,
+        ),
+        CifarRunSpec(
+            name="mmd_large_rq_star",
+            method="mmd",
+            critic_size="large",
+            critic_base_channels=64,
+            kernel="rq_star",
+            feature_dim=args.feature_dim,
+            use_gp=True,
+            activation_penalty=args.activation_penalty,
+        ),
+        CifarRunSpec(
+            name="mmd_small_rbf",
+            method="mmd",
+            critic_size="small",
+            critic_base_channels=16,
+            kernel="rbf",
+            feature_dim=args.feature_dim,
+            use_gp=True,
+            activation_penalty=args.activation_penalty,
+        ),
+    ]
+
+    if args.suite == "paper" or args.include_wgan:
+        suite.append(
+            CifarRunSpec(
+                name="wgan_large",
+                method="wgan",
+                critic_size="large",
+                critic_base_channels=64,
+                kernel=None,
+                feature_dim=None,
+                use_gp=True,
+                activation_penalty=0.0,
+            )
+        )
+    return suite
+
+
+def selected_run_names(raw: str) -> List[str]:
+    return [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+
+
+def filter_suite(specs: List[CifarRunSpec], raw_names: str) -> List[CifarRunSpec]:
+    requested = selected_run_names(raw_names)
+    if not requested:
+        return specs
+
+    by_name = {spec.name: spec for spec in specs}
+    unknown = [name for name in requested if name not in by_name]
+    if unknown:
+        available = ",".join(by_name.keys())
+        raise ValueError(f"Unknown run name(s): {','.join(unknown)}. Available runs: {available}")
+
+    return [by_name[name] for name in requested]
+
+
+def train_mmd_run(
+    spec: CifarRunSpec,
     args: argparse.Namespace,
     device: torch.device,
     run_root: Path,
     train_loader: DataLoader,
     eval_loader: DataLoader,
 ) -> Dict:
-    run_dir = ensure_dir(run_root / f"mmd_{kernel_name}")
-    kernel = build_kernel(kernel_name)
+    assert spec.kernel is not None
+    assert spec.feature_dim is not None
 
-    G = DCGANGenerator(z_dim=args.z_dim, base_channels=args.base_channels).to(device)
-    C = DCGANFeatureCritic(base_channels=args.base_channels, feature_dim=args.feature_dim).to(device)
+    kernel = build_mmd_kernel(spec.kernel)
+    run_dir = ensure_dir(run_root / spec.name)
+
+    G = DCGANGenerator(z_dim=args.z_dim, base_channels=args.generator_base_channels).to(device)
+    C = DCGANFeatureCritic(base_channels=spec.critic_base_channels, feature_dim=spec.feature_dim).to(device)
 
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr_g, betas=(0.5, 0.9))
     opt_c = torch.optim.Adam(C.parameters(), lr=args.lr_c, betas=(0.5, 0.9))
 
-    logs: Dict[str, List[float]] = {"step": [], "mmd2": [], "loss_g": [], "loss_c": [], "gp": []}
+    logs: Dict[str, List[float]] = {
+        "step": [],
+        "mmd2": [],
+        "loss_g": [],
+        "loss_c": [],
+        "gp": [],
+        "feature_norm_real": [],
+        "feature_norm_fake": [],
+        "elapsed_sec": [],
+    }
     metric_logs: List[Dict] = []
 
     data_iter = infinite_loader(train_loader)
     fixed_noise = torch.randn(64, args.z_dim, device=device)
+    start = perf_counter()
 
-    for step in trange(1, args.steps + 1, desc=f"MMD-{kernel_name}"):
+    for step in trange(1, args.steps + 1, desc=spec.name):
         gp_value = torch.zeros((), device=device)
+        loss_c = torch.zeros((), device=device)
+        mmd2 = torch.zeros((), device=device)
+        feat_real = torch.zeros((), device=device)
+        feat_fake = torch.zeros((), device=device)
 
         for _ in range(args.critic_steps):
             real = next(data_iter)[0].to(device, non_blocking=True)
@@ -151,14 +276,13 @@ def train_mmd(
 
             feat_real = C(real)
             feat_fake = C(fake)
-
             mmd2 = mmd2_unbiased(feat_real, feat_fake, kernel)
             gp_value = (
                 grad_penalty_features(C, real, fake, args.gp_lambda_mmd)
-                if args.use_gp
+                if spec.use_gp
                 else torch.zeros((), device=device)
             )
-            activation_pen = args.activation_penalty * (feat_real.pow(2).mean() + feat_fake.pow(2).mean())
+            activation_pen = spec.activation_penalty * (feat_real.pow(2).mean() + feat_fake.pow(2).mean())
             loss_c = -mmd2 + gp_value + activation_pen
 
             opt_c.zero_grad(set_to_none=True)
@@ -167,7 +291,9 @@ def train_mmd(
 
         real = next(data_iter)[0].to(device, non_blocking=True)
         fake = G(torch.randn(args.batch_size, args.z_dim, device=device))
-        loss_g = mmd2_unbiased(C(real), C(fake), kernel)
+        feat_real = C(real)
+        feat_fake = C(fake)
+        loss_g = mmd2_unbiased(feat_real, feat_fake, kernel)
 
         opt_g.zero_grad(set_to_none=True)
         loss_g.backward()
@@ -179,9 +305,12 @@ def train_mmd(
             logs["loss_g"].append(float(loss_g.detach().cpu()))
             logs["loss_c"].append(float(loss_c.detach().cpu()))
             logs["gp"].append(float(gp_value.detach().cpu()))
+            logs["feature_norm_real"].append(mean_feature_norm(feat_real))
+            logs["feature_norm_fake"].append(mean_feature_norm(feat_fake))
+            logs["elapsed_sec"].append(perf_counter() - start)
 
         if step % args.sample_every == 0 or step == args.steps:
-            _sample_and_save(G, fixed_noise, run_dir / f"samples_step-{step:07d}.png")
+            save_grid(G, fixed_noise, run_dir / f"samples_step-{step:07d}.png")
 
         if args.metrics_every > 0 and (step % args.metrics_every == 0 or step == args.steps):
             G.eval()
@@ -190,25 +319,31 @@ def train_mmd(
                 real_loader=eval_loader,
                 z_dim=args.z_dim,
                 device=device,
-                num_samples=args.metric_samples,
+                num_samples=metric_sample_budget(args, step),
             )
             G.train()
 
-            entry = {"step": step, **metrics}
+            entry = {
+                "step": step,
+                "num_samples": metric_sample_budget(args, step),
+                "elapsed_sec": perf_counter() - start,
+                "feature_norm_real": mean_feature_norm(feat_real),
+                "feature_norm_fake": mean_feature_norm(feat_fake),
+                **metrics,
+            }
             if warning is not None:
                 entry["warning"] = warning
-            metric_logs.append(entry)
-            if warning is not None:
                 print(f"[warn] {warning}")
+            metric_logs.append(entry)
 
         if step % args.save_every == 0 or step == args.steps:
             torch.save(
                 {
                     "step": step,
+                    "spec": asdict(spec),
+                    "args": vars(args),
                     "generator": G.state_dict(),
                     "critic": C.state_dict(),
-                    "args": vars(args),
-                    "kernel": kernel_name,
                     "logs": logs,
                     "metric_logs": metric_logs,
                 },
@@ -216,8 +351,7 @@ def train_mmd(
             )
 
     result = {
-        "method": "mmd",
-        "kernel": kernel_name,
+        "spec": asdict(spec),
         "logs": logs,
         "metrics": metric_logs,
         "run_dir": str(run_dir),
@@ -226,28 +360,37 @@ def train_mmd(
     return result
 
 
-def train_wgan(
+def train_wgan_run(
+    spec: CifarRunSpec,
     args: argparse.Namespace,
     device: torch.device,
     run_root: Path,
     train_loader: DataLoader,
     eval_loader: DataLoader,
 ) -> Dict:
-    run_dir = ensure_dir(run_root / "wgan_gp")
+    run_dir = ensure_dir(run_root / spec.name)
 
-    G = DCGANGenerator(z_dim=args.z_dim, base_channels=args.base_channels).to(device)
-    D = DCGANScalarCritic(base_channels=args.base_channels).to(device)
+    G = DCGANGenerator(z_dim=args.z_dim, base_channels=args.generator_base_channels).to(device)
+    D = DCGANScalarCritic(base_channels=spec.critic_base_channels).to(device)
 
     opt_g = torch.optim.Adam(G.parameters(), lr=args.lr_g, betas=(0.5, 0.9))
     opt_d = torch.optim.Adam(D.parameters(), lr=args.lr_c, betas=(0.5, 0.9))
 
-    logs: Dict[str, List[float]] = {"step": [], "wass": [], "loss_g": [], "loss_d": [], "gp": []}
+    logs: Dict[str, List[float]] = {
+        "step": [],
+        "wass": [],
+        "loss_g": [],
+        "loss_d": [],
+        "gp": [],
+        "elapsed_sec": [],
+    }
     metric_logs: List[Dict] = []
 
     data_iter = infinite_loader(train_loader)
     fixed_noise = torch.randn(64, args.z_dim, device=device)
+    start = perf_counter()
 
-    for step in trange(1, args.steps + 1, desc="WGAN-GP"):
+    for step in trange(1, args.steps + 1, desc=spec.name):
         gp_value = torch.zeros((), device=device)
         wass = torch.zeros((), device=device)
 
@@ -278,9 +421,10 @@ def train_wgan(
             logs["loss_g"].append(float(loss_g.detach().cpu()))
             logs["loss_d"].append(float(loss_d.detach().cpu()))
             logs["gp"].append(float(gp_value.detach().cpu()))
+            logs["elapsed_sec"].append(perf_counter() - start)
 
         if step % args.sample_every == 0 or step == args.steps:
-            _sample_and_save(G, fixed_noise, run_dir / f"samples_step-{step:07d}.png")
+            save_grid(G, fixed_noise, run_dir / f"samples_step-{step:07d}.png")
 
         if args.metrics_every > 0 and (step % args.metrics_every == 0 or step == args.steps):
             G.eval()
@@ -289,24 +433,29 @@ def train_wgan(
                 real_loader=eval_loader,
                 z_dim=args.z_dim,
                 device=device,
-                num_samples=args.metric_samples,
+                num_samples=metric_sample_budget(args, step),
             )
             G.train()
 
-            entry = {"step": step, **metrics}
+            entry = {
+                "step": step,
+                "num_samples": metric_sample_budget(args, step),
+                "elapsed_sec": perf_counter() - start,
+                **metrics,
+            }
             if warning is not None:
                 entry["warning"] = warning
-            metric_logs.append(entry)
-            if warning is not None:
                 print(f"[warn] {warning}")
+            metric_logs.append(entry)
 
         if step % args.save_every == 0 or step == args.steps:
             torch.save(
                 {
                     "step": step,
+                    "spec": asdict(spec),
+                    "args": vars(args),
                     "generator": G.state_dict(),
                     "critic": D.state_dict(),
-                    "args": vars(args),
                     "logs": logs,
                     "metric_logs": metric_logs,
                 },
@@ -314,13 +463,30 @@ def train_wgan(
             )
 
     result = {
-        "method": "wgan-gp",
+        "spec": asdict(spec),
         "logs": logs,
         "metrics": metric_logs,
         "run_dir": str(run_dir),
     }
     save_json(result, run_dir / "summary.json")
     return result
+
+
+def build_matrix_markdown(specs: List[CifarRunSpec]) -> str:
+    lines = [
+        "# CIFAR-10 v2 Matrix",
+        "",
+        "| Model | Critic size | Kernel | GP | Activation penalty |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for spec in specs:
+        kernel = spec.kernel if spec.kernel is not None else "-"
+        activation = "yes" if spec.activation_penalty > 0 else "-"
+        lines.append(
+            f"| {spec.method.upper()} | {spec.critic_size} | {kernel} | "
+            f"{'yes' if spec.use_gp else 'no'} | {activation} |"
+        )
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -330,9 +496,11 @@ def main() -> None:
 
     device = pick_device(prefer_cuda=True)
     run_root = ensure_dir(Path(args.outdir) / timestamp())
+    suite = filter_suite(build_suite(args), args.runs)
 
     print(f"[info] device: {device_summary(device)}")
     print(f"[info] output root: {run_root}")
+    print(f"[info] runs: {[spec.name for spec in suite]}")
 
     train_loader, eval_loader = get_cifar_loaders(
         data_root=Path(args.data_root),
@@ -342,29 +510,27 @@ def main() -> None:
     )
 
     all_results: List[Dict] = []
-
-    if args.method == "mmd":
-        kernels = [k.strip().lower() for k in args.kernel_list.split(",") if k.strip()]
-        for kernel in kernels:
-            all_results.append(train_mmd(kernel, args, device, run_root, train_loader, eval_loader))
-
-        if args.run_baseline_wgan:
-            all_results.append(train_wgan(args, device, run_root, train_loader, eval_loader))
-    else:
-        all_results.append(train_wgan(args, device, run_root, train_loader, eval_loader))
+    for spec in suite:
+        if spec.method == "mmd":
+            result = train_mmd_run(spec, args, device, run_root, train_loader, eval_loader)
+        else:
+            result = train_wgan_run(spec, args, device, run_root, train_loader, eval_loader)
+        all_results.append(result)
 
     summary = {
         "args": vars(args),
         "device": device_summary(device),
+        "suite": [asdict(spec) for spec in suite],
         "results": all_results,
         "run_root": str(run_root),
     }
     save_json(summary, run_root / "summary_all.json")
+    (run_root / "comparison_matrix.md").write_text(build_matrix_markdown(suite))
 
-    print("\n[summary] runs completed:")
-    for r in all_results:
-        tag = f"{r['method']} ({r.get('kernel', '-')})"
-        print(f"  - {tag}: {r['run_dir']}")
+    print("\n[summary] completed runs")
+    for result in all_results:
+        spec = result["spec"]
+        print(f"  {spec['name']}: {result['run_dir']}")
 
 
 if __name__ == "__main__":
