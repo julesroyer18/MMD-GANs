@@ -19,10 +19,14 @@ class DCGANGenerator(nn.Module):
             nn.ConvTranspose2d(z_dim, base_channels * 8, 4, 1, 0, bias=False),
             nn.BatchNorm2d(base_channels * 8),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(base_channels * 8, base_channels * 4, 4, 2, 1, bias=False),
+            nn.ConvTranspose2d(
+                base_channels * 8, base_channels * 4, 4, 2, 1, bias=False
+            ),
             nn.BatchNorm2d(base_channels * 4),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 4, 2, 1, bias=False),
+            nn.ConvTranspose2d(
+                base_channels * 4, base_channels * 2, 4, 2, 1, bias=False
+            ),
             nn.BatchNorm2d(base_channels * 2),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(base_channels * 2, 3, 4, 2, 1, bias=False),
@@ -30,6 +34,8 @@ class DCGANGenerator(nn.Module):
         )
 
         self.apply(weights_init)
+
+    # TRYING TO REPLACE BATCHNORM BY LAYERNORM
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         if z.ndim == 2:
